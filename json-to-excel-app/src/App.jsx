@@ -263,6 +263,28 @@ function validateDte(json, tipoDte, bodyArr) {
       add("warn", `La suma de compras por línea (${s}) no coincide con el total de compra (${rs.totalCompra}).`);
   }
 
+  if (tipoDte === "09" && bodyArr.length) {
+    const b = bodyArr[0];
+    const n = (v) => (typeof num(v) === "number" ? num(v) : null);
+    const [valOp, sinPerc, sub, iva, sujeto, ivaPerc, com, pct, ivaCom, liquido] = [
+      b.valorOperaciones, b.montoSinPercepcion, b.subTotal, b.iva, b.montoSujetoPercepcion,
+      b.ivaPercibido, b.comision, b.porcentComision, b.ivaComision, b.liquidoApagar,
+    ].map(n);
+    const ok = (...v) => v.every((x) => x !== null);
+    if (ok(sujeto, sub, iva, sinPerc) && !close(sujeto, round2(sub - iva - sinPerc), 0.02))
+      add("warn", `Monto sujeto a percepción (${sujeto}) no coincide con subtotal − IVA − no sujetos (${round2(sub - iva - sinPerc)}).`);
+    if (ok(ivaPerc, sujeto) && !close(round2(sujeto * 0.02), ivaPerc, 0.02))
+      add("warn", `El IVA percibido (${ivaPerc}) no equivale al 2% del monto sujeto (${round2(sujeto * 0.02)}).`);
+    if (ok(com, pct, sujeto) && !close(round2((sujeto * pct) / 100), com, 0.02))
+      add("warn", `La comisión (${com}) no equivale a ${pct}% del monto sujeto (${round2((sujeto * pct) / 100)}).`);
+    if (ok(ivaCom, com) && !close(round2(com * 0.13), ivaCom, 0.02))
+      add("warn", `El IVA de la comisión (${ivaCom}) no equivale al 13% de la comisión (${round2(com * 0.13)}).`);
+    if (ok(liquido, sub, ivaPerc, com, ivaCom) && !close(round2(sub - ivaPerc - com - ivaCom), liquido, 0.02))
+      add("warn", `El valor a pagar al agente (${liquido}) no cuadra con subtotal − IVA percibido − comisión − IVA comisión (${round2(sub - ivaPerc - com - ivaCom)}).`);
+    if (ok(valOp, sub) && !close(valOp, sub, 0.02))
+      add("warn", `El valor de las operaciones (${valOp}) difiere del subtotal (${sub}).`);
+  }
+
   return out;
 }
 
@@ -281,7 +303,35 @@ const VAL_STYLE = {
 /* ----------------------------------------------------------------
    Normalización
    ---------------------------------------------------------------- */
+const MODELO = { 1: "Previo", 2: "Diferido" };
+const OPERACION = { 1: "Normal", 2: "Contingencia" };
+const fmtTributos = (arr) =>
+  Array.isArray(arr)
+    ? arr.map((t) => `${txt(t.codigo)}${t.descripcion ? ` ${t.descripcion}` : ""}: ${txt(t.valor)}`).join(" | ")
+    : "";
+const fmtPagos = (arr) =>
+  Array.isArray(arr)
+    ? arr
+        .map(
+          (p) =>
+            `Código ${txt(p.codigo)}: ${txt(p.montoPago)}${p.referencia ? ` (ref. ${p.referencia})` : ""}${p.plazo ? ` plazo ${p.plazo} ${txt(p.periodo)}` : ""}`
+        )
+        .join(" | ")
+    : "";
+const fmtDir = (d) =>
+  d
+    ? [d.complemento, d.municipio && `Mun. ${d.municipio}`, d.departamento && `Depto. ${d.departamento}`]
+        .filter(Boolean)
+        .join(", ")
+    : "";
+const fmtDocRel = (arr) =>
+  Array.isArray(arr)
+    ? arr.map((d) => `${txt(d.tipoDocumento)}: ${txt(d.numeroDocumento)} (${txt(d.fechaEmision)})`).join(" | ")
+    : "";
+const actividad = (o) => [o.codActividad, o.descActividad].filter(Boolean).join(" - ");
+
 function normalizeDte(json, filename) {
+  const ext = json.extension || {};
   const ident = json.identificacion || {};
   const emisor = json.emisor || {};
   const receptor = json.receptor || json.sujetoExcluido || {};
@@ -294,6 +344,7 @@ function normalizeDte(json, filename) {
   const bucket = bucketFor(tipoDte);
   const isRet = tipoDte === "07";
   const isDcl = tipoDte === "09";
+  const l = isDcl ? b0 : {};
 
   let iva = "";
   if (typeof resumen.totalIva === "number") iva = resumen.totalIva;
@@ -349,6 +400,10 @@ function normalizeDte(json, filename) {
       montoSujeto: num(it.montoSujetoGrav),
       ivaRetItem: num(it.ivaRetenido),
       codRetencion: txt(it.codigoRetencionMH),
+      tipoItem: txt(it.tipoItem),
+      noGravado: num(it.noGravado),
+      psv: num(it.psv),
+      tributosItem: Array.isArray(it.tributos) ? it.tributos.join(", ") : txt(it.tributos),
     };
   });
 
@@ -389,6 +444,60 @@ function normalizeDte(json, filename) {
     condicionOperacion: CONDICION_OP[resumen.condicionOperacion] || "",
     sello: json.selloRecibido || json.sello_recibido || "",
     nDocs: bodyArr.length,
+    tipoModelo: MODELO[ident.tipoModelo] || txt(ident.tipoModelo),
+    tipoOperacion: OPERACION[ident.tipoOperacion] || txt(ident.tipoOperacion),
+    emisorNombreComercial: txt(emisor.nombreComercial),
+    emisorActividad: actividad(emisor),
+    emisorDireccion: fmtDir(emisor.direccion),
+    emisorTelefono: txt(emisor.telefono),
+    emisorCorreo: txt(emisor.correo),
+    receptorNrc: txt(receptor.nrc),
+    receptorActividad: actividad(receptor),
+    receptorDireccion: fmtDir(receptor.direccion),
+    receptorTelefono: txt(receptor.telefono),
+    receptorCorreo: txt(receptor.correo),
+    subTotalVentas: num(resumen.subTotalVentas),
+    descuNoSuj: num(resumen.descuNoSuj),
+    descuExenta: num(resumen.descuExenta),
+    descuGravada: num(resumen.descuGravada),
+    subTotal: num(resumen.subTotal),
+    ivaPerci: num(resumen.ivaPerci1 ?? resumen.ivaPerci),
+    montoTotalOperacion: isRet ? "" : num(resumen.montoTotalOperacion),
+    totalNoGravado: num(resumen.totalNoGravado),
+    totalPagar: isRet ? "" : num(isDcl ? b0.liquidoApagar : resumen.totalPagar),
+    saldoFavor: num(resumen.saldoFavor),
+    totalLetras: txt(resumen.totalLetras ?? resumen.totalIVAretenidoLetras ?? l.totalLetras ?? l.valorLetras),
+    pagos: fmtPagos(resumen.pagos),
+    numPagoElectronico: txt(resumen.numPagoElectronico),
+    docRelacionado: fmtDocRel(json.documentoRelacionado),
+    nombEntrega: txt(ext.nombEntrega),
+    docuEntrega: txt(ext.docuEntrega),
+    nombRecibe: txt(ext.nombRecibe),
+    docuRecibe: txt(ext.docuRecibe),
+    placaVehiculo: txt(ext.placaVehiculo),
+    observaciones: txt(ext.observaciones ?? resumen.observaciones ?? l.observaciones),
+    // Documento Contable de Liquidación (09)
+    liqFechaInicio: txt(l.periodoLiquidacionFechaInicio),
+    liqFechaFin: txt(l.periodoLiquidacionFechaFin),
+    liqCodigo: txt(l.codLiqui),
+    liqCantDoc: num(l.cantidadDoc),
+    liqValorOperaciones: num(l.valorOperaciones),
+    liqDescripSinPercepcion: txt(l.descripSinPercepcion),
+    liqMontoSinPercepcion: num(l.montoSinPercepcion),
+    liqSubTotal: num(l.subTotal),
+    liqIva: num(l.iva),
+    liqMontoSujetoPercepcion: num(l.montoSujetoPercepcion),
+    liqIvaPercibido: num(l.ivaPercibido),
+    liqComision: num(l.comision),
+    liqPorcentComision: num(l.porcentComision),
+    liqIvaComision: num(l.ivaComision),
+    liqLiquidoApagar: num(l.liquidoApagar),
+    liqObservaciones: txt(l.observaciones),
+    apendice: Array.isArray(json.apendice) ? json.apendice : [],
+    flat: (() => {
+      const { firmaElectronica, ...rest } = json;
+      return flattenObject(rest);
+    })(),
     issues,
     valEstado: VAL_LABEL[status],
     valStatus: status,
@@ -422,25 +531,107 @@ const RESUMEN_COLS = [
   ["codigoGeneracion", "Código de generación"],
   ["sello", "Sello de recepción"],
   ["numeroControl", "Número de control"],
+  ["tipoModelo", "Modelo de facturación"],
+  ["tipoOperacion", "Tipo de transmisión"],
   ["emisorNombre", "Emisor"],
+  ["emisorNombreComercial", "Nombre comercial emisor"],
   ["emisorNit", "NIT emisor"],
   ["emisorNrc", "NRC emisor"],
+  ["emisorActividad", "Actividad emisor"],
+  ["emisorDireccion", "Dirección emisor"],
+  ["emisorTelefono", "Teléfono emisor"],
+  ["emisorCorreo", "Correo emisor"],
   ["receptorNombre", "Receptor"],
   ["receptorDoc", "NIT / DUI receptor"],
-  ["ventaGravada", "Venta gravada"],
-  ["ventaExenta", "Venta exenta"],
-  ["ventaNoSuj", "Venta no sujeta"],
-  ["descuento", "Descuento"],
-  ["iva", "IVA"],
-  ["montoSujeto", "Monto sujeto"],
+  ["receptorNrc", "NRC receptor"],
+  ["receptorActividad", "Actividad receptor"],
+  ["receptorDireccion", "Dirección receptor"],
+  ["receptorTelefono", "Teléfono receptor"],
+  ["receptorCorreo", "Correo receptor"],
+  ["ventaNoSuj", "Ventas no sujetas"],
+  ["ventaExenta", "Ventas exentas"],
+  ["ventaGravada", "Ventas gravadas"],
+  ["subTotalVentas", "Suma de operaciones"],
+  ["descuNoSuj", "Descuento no sujetas"],
+  ["descuExenta", "Descuento exentas"],
+  ["descuGravada", "Descuento gravadas"],
+  ["descuento", "Total descuentos"],
+  ["subTotal", "Subtotal"],
+  ["iva", "IVA 13%"],
+  ["ivaPerci", "IVA percibido"],
   ["ivaRetenido", "IVA retenido (1%)"],
-  ["rentaRetenida", "Renta retenida"],
-  ["total", "Total a pagar"],
+  ["rentaRetenida", "Retención de renta"],
+  ["montoSujeto", "Monto sujeto"],
+  ["montoTotalOperacion", "Monto total de la operación"],
+  ["totalNoGravado", "Otros montos no afectos"],
+  ["totalPagar", "Total a pagar"],
+  ["saldoFavor", "Saldo a favor"],
+  ["totalLetras", "Valor en letras"],
   ["condicionOperacion", "Condición de operación"],
+  ["pagos", "Pagos"],
+  ["numPagoElectronico", "N° pago electrónico"],
+  ["docRelacionado", "Documentos relacionados"],
+  ["nombEntrega", "Nombre de quien entrega"],
+  ["docuEntrega", "Documento de quien entrega"],
+  ["nombRecibe", "Nombre de quien recibe"],
+  ["docuRecibe", "Documento de quien recibe"],
+  ["placaVehiculo", "Placa de vehículo"],
+  ["observaciones", "Observaciones"],
+  ["liqFechaInicio", "Liquidación: fecha inicio del período"],
+  ["liqFechaFin", "Liquidación: fecha fin del período"],
+  ["liqCodigo", "Liquidación: código"],
+  ["liqCantDoc", "Liquidación: cantidad de documentos"],
+  ["liqValorOperaciones", "Liquidación: valor de las operaciones"],
+  ["liqDescripSinPercepcion", "Liquidación: descripción monto no sujeto"],
+  ["liqMontoSinPercepcion", "Liquidación: valores no sujetos a percepción"],
+  ["liqSubTotal", "Liquidación: subtotal"],
+  ["liqIva", "Liquidación: IVA de las operaciones"],
+  ["liqMontoSujetoPercepcion", "Liquidación: montos sujetos a percepción sin IVA"],
+  ["liqIvaPercibido", "Liquidación: IVA percibido (2%)"],
+  ["liqComision", "Liquidación: comisión"],
+  ["liqPorcentComision", "Liquidación: porcentaje de comisión"],
+  ["liqIvaComision", "Liquidación: IVA de la comisión"],
+  ["liqLiquidoApagar", "Liquidación: valor a pagar al agente"],
+  ["liqObservaciones", "Liquidación: observaciones"],
   ["valEstado", "Validación local"],
   ["valDetalle", "Detalle de validación"],
   ["urlMH", "Consulta pública MH"],
 ];
+const LIQ_COLS = [
+  ["archivo", "Archivo"],
+  ["tipoLabel", "Tipo de documento"],
+  ["fechaEmision", "Fecha de emisión"],
+  ["codigoGeneracion", "Código de generación"],
+  ["sello", "Sello de recepción"],
+  ["numeroControl", "Número de control"],
+  ["emisorNombre", "Emisor"],
+  ["emisorNit", "NIT emisor"],
+  ["receptorNombre", "Receptor"],
+  ["receptorDoc", "NIT / DUI receptor"],
+  ["liqFechaInicio", "Fecha inicio del período de liquidación"],
+  ["liqFechaFin", "Fecha fin del período de liquidación"],
+  ["liqCodigo", "Código de liquidación"],
+  ["liqCantDoc", "Cantidad de documentos"],
+  ["liqValorOperaciones", "Valor de las operaciones a liquidar"],
+  ["liqDescripSinPercepcion", "Descripción del monto no sujeto a percepción"],
+  ["liqMontoSinPercepcion", "Valores no sujetos a percepción"],
+  ["liqSubTotal", "Subtotal"],
+  ["liqIva", "IVA de las operaciones a liquidar"],
+  ["liqMontoSujetoPercepcion", "Montos sujetos a percepción sin IVA"],
+  ["liqIvaPercibido", "IVA percibido (2%)"],
+  ["liqComision", "Comisión"],
+  ["liqPorcentComision", "Porcentaje de comisión"],
+  ["liqIvaComision", "IVA de la comisión"],
+  ["liqLiquidoApagar", "Valor a pagar al agente"],
+  ["totalLetras", "Valor en letras"],
+  ["liqObservaciones", "Observaciones"],
+  ["ivaPerci", "IVA percibido (doc. 08)"],
+  ["montoTotalOperacion", "Monto total de la operación (doc. 08)"],
+  ["valEstado", "Validación local"],
+  ["valDetalle", "Detalle de validación"],
+  ["urlMH", "Consulta pública MH"],
+];
+const colsFor = (b) => (b === "Retención IVA" ? RET_COLS : b === "Liquidación" ? LIQ_COLS : RESUMEN_COLS);
 const RET_COLS = [
   ["archivo", "Archivo"],
   ["fechaEmision", "Fecha de emisión"],
@@ -454,6 +645,10 @@ const RET_COLS = [
   ["nDocs", "N° docs. relacionados"],
   ["montoSujeto", "Monto sujeto a retención"],
   ["ivaRetenido", "IVA retenido (1%)"],
+  ["totalLetras", "Valor en letras"],
+  ["nombEntrega", "Nombre de quien entrega"],
+  ["docuEntrega", "Documento de quien entrega"],
+  ["observaciones", "Observaciones"],
   ["valEstado", "Validación local"],
   ["valDetalle", "Detalle de validación"],
   ["urlMH", "Consulta pública MH"],
@@ -471,11 +666,34 @@ const MONEY_KEYS = new Set([
   "precioUni",
   "descu",
   "ivaRetItem",
+  "subTotalVentas",
+  "descuNoSuj",
+  "descuExenta",
+  "descuGravada",
+  "subTotal",
+  "ivaPerci",
+  "montoTotalOperacion",
+  "totalNoGravado",
+  "totalPagar",
+  "saldoFavor",
+  "liqValorOperaciones",
+  "liqMontoSinPercepcion",
+  "liqSubTotal",
+  "liqIva",
+  "liqMontoSujetoPercepcion",
+  "liqIvaPercibido",
+  "liqComision",
+  "liqPorcentComision",
+  "liqIvaComision",
+  "liqLiquidoApagar",
+  "noGravado",
+  "psv",
 ]);
 const ITEM_COLS = [
   ["archivo", "Archivo"],
   ["numeroControl", "Número de control"],
   ["numItem", "N° item"],
+  ["tipoItem", "Tipo de ítem"],
   ["codigo", "Código"],
   ["descripcion", "Descripción"],
   ["docRel", "Documento relacionado"],
@@ -487,6 +705,9 @@ const ITEM_COLS = [
   ["ventaNoSuj", "Venta no sujeta"],
   ["ventaExenta", "Venta exenta"],
   ["ventaGravada", "Venta gravada"],
+  ["noGravado", "No gravado"],
+  ["psv", "Precio sugerido (PSV)"],
+  ["tributosItem", "Tributos del ítem"],
   ["montoSujeto", "Monto sujeto"],
   ["ivaRetItem", "IVA retenido"],
   ["codRetencion", "Código retención MH"],
@@ -540,7 +761,8 @@ function sheetFromGeneric(flatRows) {
       if (!keySet.includes(k)) keySet.push(k);
     })
   );
-  const aoa = [keySet, ...flatRows.map((r) => keySet.map((k) => r[k] ?? ""))];
+  const cut = (v) => (typeof v === "string" && v.length > 32000 ? v.slice(0, 32000) : v);
+  const aoa = [keySet, ...flatRows.map((r) => keySet.map((k) => cut(r[k] ?? "")))];
   const ws = XLSX.utils.aoa_to_sheet(aoa);
   ws["!cols"] = keySet.map((k) => ({ wch: Math.max(12, Math.min(32, k.length + 4)) }));
   return ws;
@@ -557,22 +779,44 @@ function addSheet(wb, name, ws) {
   XLSX.utils.book_append_sheet(wb, ws, n);
 }
 
-function buildWorkbook(docs, { separarPorTipo, incluirDetalle }) {
+function buildWorkbook(docs, { separarPorTipo, incluirDetalle, incluirTodo }) {
   const dte = docs.filter((d) => d.kind === "dte");
   const generic = docs.filter((d) => d.kind === "generic");
   const wb = XLSX.utils.book_new();
 
+  // Campos del apéndice del DTE (cajero, recibo, cliente, lote, etc.): una columna por campo
+  const apMap = new Map();
+  dte.forEach((d) =>
+    d.apendice.forEach((a) => {
+      if (!apMap.has(a.campo)) apMap.set(a.campo, a.etiqueta || a.campo);
+    })
+  );
+  const apCols = [...apMap].map(([campo, etiqueta]) => [`ap:${campo}`, `Apéndice: ${etiqueta}`]);
+  const dteRows = dte.map((d) => {
+    const o = { ...d };
+    d.apendice.forEach((a) => {
+      o[`ap:${a.campo}`] = txt(a.valor);
+    });
+    return o;
+  });
+
   if (dte.length) {
     if (separarPorTipo) {
       BUCKETS.forEach((b) => {
-        const rows = dte.filter((d) => d.bucket === b);
+        const rows = dteRows.filter((d) => d.bucket === b);
         if (rows.length)
-          addSheet(wb, `Resumen - ${b}`, sheetFromCols(rows, b === "Retención IVA" ? RET_COLS : RESUMEN_COLS));
+          addSheet(
+            wb,
+            `Resumen - ${b}`,
+            sheetFromCols(rows, [...colsFor(b), ...apCols])
+          );
       });
     } else {
-      addSheet(wb, "Resumen DTE", sheetFromCols(dte, RESUMEN_COLS));
-      const ret = dte.filter((d) => d.bucket === "Retención IVA");
-      if (ret.length) addSheet(wb, "Retenciones IVA", sheetFromCols(ret, RET_COLS));
+      addSheet(wb, "Resumen DTE", sheetFromCols(dteRows, [...RESUMEN_COLS, ...apCols]));
+      const ret = dteRows.filter((d) => d.bucket === "Retención IVA");
+      if (ret.length) addSheet(wb, "Retenciones IVA", sheetFromCols(ret, [...RET_COLS, ...apCols]));
+      const liq = dteRows.filter((d) => d.bucket === "Liquidación");
+      if (liq.length) addSheet(wb, "Liquidaciones", sheetFromCols(liq, [...LIQ_COLS, ...apCols]));
     }
 
     if (incluirDetalle) {
@@ -609,6 +853,10 @@ function buildWorkbook(docs, { separarPorTipo, incluirDetalle }) {
           ]
     );
     addSheet(wb, "Validación", sheetFromCols(valRows, VAL_COLS));
+
+    if (incluirTodo) {
+      addSheet(wb, "Todos los campos", sheetFromGeneric(dte.map((d) => ({ Archivo: d.archivo, ...d.flat }))));
+    }
   }
 
   if (generic.length) {
@@ -695,6 +943,7 @@ export default function JsonToExcelApp() {
   const [entries, setEntries] = useState([]); // {id, name, status, doc?, errorMsg?}
   const [separarPorTipo, setSepararPorTipo] = useState(true);
   const [incluirDetalle, setIncluirDetalle] = useState(true);
+  const [incluirTodo, setIncluirTodo] = useState(true);
   const [dragOver, setDragOver] = useState(false);
   const [pasteOpen, setPasteOpen] = useState(false);
   const [pasteText, setPasteText] = useState("");
@@ -788,7 +1037,7 @@ export default function JsonToExcelApp() {
 
   const download = () => {
     if (!docs.length) return;
-    const wb = buildWorkbook(docs, { separarPorTipo, incluirDetalle });
+    const wb = buildWorkbook(docs, { separarPorTipo, incluirDetalle, incluirTodo });
     const today = new Date().toISOString().slice(0, 10);
     XLSX.writeFile(wb, `dte_el_salvador_${today}.xlsx`);
   };
@@ -1067,6 +1316,20 @@ export default function JsonToExcelApp() {
                   Incluir detalle de productos
                   <div style={{ color: C.inkFaint, fontSize: 12 }}>
                     Agrega hoja(s) con cada línea; en retenciones, cada documento relacionado con su monto sujeto y retención.
+                  </div>
+                </span>
+              </label>
+              <label style={{ display: "flex", alignItems: "flex-start", gap: 9, fontSize: 13, marginTop: 12, cursor: "pointer" }}>
+                <input
+                  type="checkbox"
+                  checked={incluirTodo}
+                  onChange={(e) => setIncluirTodo(e.target.checked)}
+                  style={{ marginTop: 2 }}
+                />
+                <span>
+                  Incluir hoja "Todos los campos"
+                  <div style={{ color: C.inkFaint, fontSize: 12 }}>
+                    Una fila por documento con absolutamente todo lo que trae el JSON, para que no falte ningún valor.
                   </div>
                 </span>
               </label>
