@@ -11,14 +11,10 @@ import {
   AlertTriangle,
   FileSpreadsheet,
   FlaskConical,
+  ExternalLink,
+  ShieldCheck,
 } from "lucide-react";
 
-/* ----------------------------------------------------------------
-   Paleta y tipografía
-   - Fondo: papel frío azulado (no el crema/terracota genérico)
-   - Tinta: azul-marino casi negro
-   - Acento: dorado sello oficial, para la acción principal
-   ---------------------------------------------------------------- */
 const C = {
   page: "#EDF1F5",
   surface: "#FFFFFF",
@@ -41,11 +37,16 @@ const C = {
   dangerTint: "#F6E1DF",
   success: "#2E7457",
   successTint: "#DFEEE6",
+  warn: "#9A6A00",
+  warnTint: "#FBF0D3",
+  violetTint: "#E8E3F4",
+  violetText: "#4A3B80",
 };
 
 const serif = "Georgia, 'Iowan Old Style', 'Times New Roman', serif";
 const sans =
   "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif";
+const mono = "ui-monospace, SFMono-Regular, Menlo, monospace";
 
 const card = {
   background: C.surface,
@@ -57,7 +58,7 @@ const card = {
    Catálogos DTE (Ministerio de Hacienda, El Salvador)
    ---------------------------------------------------------------- */
 const TIPO_DTE = {
-  "01": "Factura",
+  "01": "Factura de Consumidor Final",
   "03": "Comprobante de Crédito Fiscal",
   "04": "Nota de Remisión",
   "05": "Nota de Crédito",
@@ -71,14 +72,34 @@ const TIPO_DTE = {
 };
 const CONDICION_OP = { 1: "Contado", 2: "Crédito", 3: "Otro" };
 
+const BUCKETS = [
+  "Crédito Fiscal",
+  "Consumidor Final",
+  "Nota de Crédito",
+  "Retención IVA",
+  "Sujeto Excluido",
+  "Liquidación",
+  "Otros DTE",
+];
+const BUCKET_BY_TIPO = {
+  "01": "Consumidor Final",
+  "03": "Crédito Fiscal",
+  "05": "Nota de Crédito",
+  "07": "Retención IVA",
+  "08": "Liquidación",
+  "09": "Liquidación",
+  "14": "Sujeto Excluido",
+};
 function bucketFor(tipoDte) {
-  if (tipoDte === "03") return "Crédito Fiscal";
-  if (tipoDte === "01") return "Consumidor Final";
-  return "Otros DTE";
+  return BUCKET_BY_TIPO[tipoDte] || "Otros DTE";
 }
 const BUCKET_STYLE = {
   "Crédito Fiscal": { bg: C.navyTint, fg: C.navyText },
   "Consumidor Final": { bg: C.goldTint, fg: C.goldText },
+  "Nota de Crédito": { bg: C.dangerTint, fg: C.danger },
+  "Retención IVA": { bg: C.successTint, fg: C.success },
+  "Sujeto Excluido": { bg: C.accentSoft, fg: C.accentDeep },
+  Liquidación: { bg: C.violetTint, fg: C.violetText },
   "Otros DTE": { bg: C.greyTint, fg: C.greyText },
   "JSON genérico": { bg: C.greyTint, fg: C.greyText },
 };
@@ -87,6 +108,9 @@ const num = (v) => {
   const n = typeof v === "string" ? parseFloat(v) : v;
   return typeof n === "number" && !Number.isNaN(n) ? n : "";
 };
+const txt = (v) => (v === null || v === undefined ? "" : String(v));
+const round2 = (n) => Math.round(n * 100) / 100;
+const digits = (v) => txt(v).replace(/\D/g, "");
 
 function flattenObject(obj, prefix = "", res = {}) {
   Object.entries(obj || {}).forEach(([k, v]) => {
@@ -105,21 +129,228 @@ function flattenObject(obj, prefix = "", res = {}) {
   return res;
 }
 
+/* ----------------------------------------------------------------
+   Validación local (estructura, sello, firma y cuadre de montos)
+   OJO: esto NO reemplaza la consulta oficial del MH. Para eso se
+   genera el enlace a la Consulta Pública de cada documento.
+   ---------------------------------------------------------------- */
+const UUID_RE = /^[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}$/;
+const CONTROL_RE = /^DTE-(\d{2})-[A-Z0-9]{8}-\d{15}$/;
+const SELLO_RE = /^[A-Z0-9]{40}$/;
+
+function decodeJws(token) {
+  try {
+    const part = String(token).split(".")[1];
+    const b64 = part.replace(/-/g, "+").replace(/_/g, "/");
+    const bin = atob(b64 + "=".repeat((4 - (b64.length % 4)) % 4));
+    const bytes = Uint8Array.from(bin, (c) => c.charCodeAt(0));
+    return JSON.parse(new TextDecoder().decode(bytes));
+  } catch (e) {
+    return null;
+  }
+}
+
+// Compara estructuras; en textos solo mira letras y números (evita falsos
+// errores por tildes dañadas, ej. "RETENCI?N" vs "RETENCIÓN").
+function deepEq(a, b) {
+  if (a === b) return true;
+  if (typeof a === "string" && typeof b === "string") {
+    const clean = (s) => s.replace(/[^A-Za-z0-9]/g, "");
+    return clean(a) === clean(b);
+  }
+  if (!a || !b || typeof a !== "object" || typeof b !== "object") return false;
+  const ka = Object.keys(a);
+  const kb = Object.keys(b);
+  return ka.length === kb.length && ka.every((k) => deepEq(a[k], b[k]));
+}
+
+const close = (a, b, tol = 0.011) => Math.abs(a - b) <= tol;
+const sumBy = (arr, k) =>
+  round2(arr.reduce((s, x) => s + (typeof num(x[k]) === "number" ? num(x[k]) : 0), 0));
+
+function validateDte(json, tipoDte, bodyArr) {
+  const out = [];
+  const add = (level, msg) => out.push({ level, msg });
+  const id = json.identificacion || {};
+  const em = json.emisor || {};
+  const rs = json.resumen || {};
+  const rec = json.receptor || json.sujetoExcluido || {};
+
+  if (!TIPO_DTE[tipoDte]) add("warn", `Tipo de DTE no reconocido (${tipoDte || "vacío"}).`);
+
+  if (!UUID_RE.test(txt(id.codigoGeneracion)))
+    add("error", "El código de generación no tiene formato UUID en mayúsculas.");
+
+  const m = CONTROL_RE.exec(txt(id.numeroControl));
+  if (!m) add("error", "El número de control no tiene el formato DTE-TT-XXXXXXXX-000000000000000.");
+  else if (m[1] !== tipoDte)
+    add("error", `El número de control es del tipo ${m[1]} pero tipoDte dice ${tipoDte}.`);
+
+  const hoy = new Date().toLocaleDateString("sv-SE");
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(txt(id.fecEmi))) add("error", "Fecha de emisión inválida (se espera AAAA-MM-DD).");
+  else if (id.fecEmi > hoy) add("warn", `La fecha de emisión (${id.fecEmi}) es posterior a hoy.`);
+
+  if (id.ambiente === "00") add("warn", "Documento del ambiente de pruebas (00); no es válido fiscalmente.");
+  else if (id.ambiente !== "01") add("warn", `Ambiente desconocido (${txt(id.ambiente)}).`);
+
+  const sello = json.selloRecibido || json.sello_recibido;
+  if (!sello) add("error", "No trae sello de recepción: no hay evidencia de que el MH lo haya procesado.");
+  else if (!SELLO_RE.test(txt(sello))) add("warn", "El sello de recepción no tiene 40 caracteres alfanuméricos.");
+
+  if (digits(em.nit).length !== 14) add("error", "El NIT del emisor no tiene 14 dígitos.");
+  if (rec.tipoDocumento === "36" && digits(rec.numDocumento).length !== 14)
+    add("warn", "El receptor indica tipo de documento NIT (36) pero el número no tiene 14 dígitos.");
+  if (id.tipoMoneda && id.tipoMoneda !== "USD") add("warn", `Moneda distinta de USD (${id.tipoMoneda}).`);
+
+  // Firma electrónica: se decodifica el contenido firmado y se contrasta
+  // con el JSON. No se verifica la firma criptográfica (requiere el
+  // certificado del emisor).
+  if (!json.firmaElectronica) {
+    add("warn", "No incluye firmaElectronica: no se puede contrastar el contenido firmado.");
+  } else {
+    const p = decodeJws(json.firmaElectronica);
+    if (!p) add("warn", "No se pudo decodificar la firma electrónica.");
+    else {
+      const pid = p.identificacion || {};
+      ["codigoGeneracion", "numeroControl", "fecEmi", "horEmi"].forEach((k) => {
+        if (pid[k] !== id[k]) add("error", `El contenido firmado trae otro valor en ${k}.`);
+      });
+      if (digits(p.emisor && p.emisor.nit) !== digits(em.nit))
+        add("error", "El NIT del emisor difiere del contenido firmado.");
+      if (!deepEq(p.resumen, json.resumen))
+        add("error", "El resumen del JSON no coincide con el contenido firmado (posible alteración).");
+    }
+  }
+
+  // Cuadre de montos
+  if (tipoDte === "07") {
+    if (!bodyArr.length) add("error", "El comprobante de retención no tiene líneas en cuerpoDocumento.");
+    const sIva = sumBy(bodyArr, "ivaRetenido");
+    const sMonto = sumBy(bodyArr, "montoSujetoGrav");
+    if (typeof rs.totalIVAretenido === "number" && !close(sIva, rs.totalIVAretenido))
+      add("error", `La suma del IVA retenido por línea (${sIva}) no coincide con el resumen (${rs.totalIVAretenido}).`);
+    if (typeof rs.totalSujetoRetencion === "number" && !close(sMonto, rs.totalSujetoRetencion))
+      add("error", `La suma del monto sujeto por línea (${sMonto}) no coincide con el resumen (${rs.totalSujetoRetencion}).`);
+    bodyArr.forEach((it, i) => {
+      if (
+        txt(it.codigoRetencionMH) === "22" &&
+        typeof it.montoSujetoGrav === "number" &&
+        typeof it.ivaRetenido === "number"
+      ) {
+        const esperado = round2(it.montoSujetoGrav * 0.01);
+        if (!close(esperado, it.ivaRetenido))
+          add("warn", `Línea ${it.numItem ?? i + 1}: el 1% de ${it.montoSujetoGrav} es ${esperado}, pero se retuvo ${it.ivaRetenido}.`);
+      }
+    });
+  }
+
+  if (["01", "03", "05"].includes(tipoDte) && bodyArr.length && typeof rs.totalGravada === "number") {
+    const s = sumBy(bodyArr, "ventaGravada");
+    if (!close(s, rs.totalGravada, 0.02))
+      add("warn", `La suma de ventas gravadas por línea (${s}) no coincide con el resumen (${rs.totalGravada}).`);
+  }
+  if (["03", "05"].includes(tipoDte) && typeof rs.totalGravada === "number" && Array.isArray(rs.tributos)) {
+    const t = rs.tributos.find((x) => x.codigo === "20");
+    if (t && typeof t.valor === "number") {
+      const base = rs.totalGravada - (typeof rs.descuGravada === "number" ? rs.descuGravada : 0);
+      if (!close(round2(base * 0.13), t.valor, 0.03))
+        add("warn", `El IVA (${t.valor}) no equivale al 13% de la base gravada (${round2(base)}). Revisar.`);
+    }
+  }
+  if (tipoDte === "14" && bodyArr.length && typeof rs.totalCompra === "number") {
+    const s = sumBy(bodyArr, "compra");
+    if (!close(s, rs.totalCompra, 0.02))
+      add("warn", `La suma de compras por línea (${s}) no coincide con el total de compra (${rs.totalCompra}).`);
+  }
+
+  return out;
+}
+
+const VAL_LABEL = { ok: "Sin observaciones", warn: "Con advertencias", error: "Con errores" };
+function statusOf(issues) {
+  if (issues.some((i) => i.level === "error")) return "error";
+  if (issues.length) return "warn";
+  return "ok";
+}
+const VAL_STYLE = {
+  ok: { bg: C.successTint, fg: C.success },
+  warn: { bg: C.warnTint, fg: C.warn },
+  error: { bg: C.dangerTint, fg: C.danger },
+};
+
+/* ----------------------------------------------------------------
+   Normalización
+   ---------------------------------------------------------------- */
 function normalizeDte(json, filename) {
   const ident = json.identificacion || {};
   const emisor = json.emisor || {};
-  const receptor = json.receptor || {};
+  const receptor = json.receptor || json.sujetoExcluido || {};
   const resumen = json.resumen || {};
-  const items = Array.isArray(json.cuerpoDocumento) ? json.cuerpoDocumento : [];
+  const raw = json.cuerpoDocumento;
+  // El Documento Contable de Liquidación (09) trae cuerpoDocumento como objeto
+  const bodyArr = Array.isArray(raw) ? raw : raw && typeof raw === "object" ? [raw] : [];
+  const b0 = bodyArr[0] || {};
   const tipoDte = String(ident.tipoDte ?? "");
   const bucket = bucketFor(tipoDte);
+  const isRet = tipoDte === "07";
+  const isDcl = tipoDte === "09";
 
   let iva = "";
   if (typeof resumen.totalIva === "number") iva = resumen.totalIva;
   else if (Array.isArray(resumen.tributos)) {
     const t = resumen.tributos.find((t) => t.codigo === "20");
     if (t) iva = t.valor;
-  }
+  } else if (isDcl) iva = b0.iva;
+
+  const issues = validateDte(json, tipoDte, bodyArr);
+  const status = statusOf(issues);
+  const urlMH =
+    ident.codigoGeneracion && ident.fecEmi
+      ? `https://admin.factura.gob.sv/consultaPublica?ambiente=${ident.ambiente || "01"}&codGen=${ident.codigoGeneracion}&fechaEmi=${ident.fecEmi}`
+      : "";
+
+  const items = bodyArr.map((it, idx) => {
+    if (isDcl) {
+      return {
+        archivo: filename,
+        numeroControl: ident.numeroControl || "",
+        numItem: idx + 1,
+        codigo: txt(it.codLiqui),
+        descripcion: `Liquidación ${txt(it.codLiqui)} (${txt(it.periodoLiquidacionFechaInicio)} a ${txt(it.periodoLiquidacionFechaFin)})`,
+        cantidad: num(it.cantidadDoc),
+        unidad: "",
+        precioUni: "",
+        descu: "",
+        ventaNoSuj: "",
+        ventaExenta: "",
+        ventaGravada: num(it.valorOperaciones),
+        docRel: "",
+        fechaDocRel: "",
+        montoSujeto: num(it.montoSujetoPercepcion),
+        ivaRetItem: "",
+        codRetencion: "",
+      };
+    }
+    return {
+      archivo: filename,
+      numeroControl: ident.numeroControl || "",
+      numItem: it.numItem ?? idx + 1,
+      codigo: it.codigo || "",
+      descripcion: it.descripcion || it.obsItem || "",
+      cantidad: num(it.cantidad),
+      unidad: it.uniMedida ?? it.unidadMedida ?? "",
+      precioUni: num(it.precioUni),
+      descu: num(it.montoDescu),
+      ventaNoSuj: num(it.ventaNoSuj),
+      ventaExenta: num(it.ventaExenta),
+      ventaGravada: num(it.ventaGravada ?? it.compra),
+      docRel: txt(it.numDocumento ?? it.numeroDocumento),
+      fechaDocRel: txt(it.fechaEmision ?? it.fechaGeneracion),
+      montoSujeto: num(it.montoSujetoGrav),
+      ivaRetItem: num(it.ivaRetenido),
+      codRetencion: txt(it.codigoRetencionMH),
+    };
+  });
 
   return {
     kind: "dte",
@@ -131,35 +362,41 @@ function normalizeDte(json, filename) {
     fechaEmision: ident.fecEmi || "",
     horaEmision: ident.horEmi || "",
     emisorNombre: emisor.nombre || emisor.nombreComercial || "",
-    emisorNit: emisor.nit || "",
-    emisorNrc: emisor.nrc || "",
+    emisorNit: txt(emisor.nit),
+    emisorNrc: txt(emisor.nrc),
     receptorNombre:
       receptor.nombre || (bucket === "Consumidor Final" ? "Consumidor Final" : ""),
-    receptorDoc: receptor.nit || receptor.numDocumento || receptor.dui || "",
-    ventaGravada: num(resumen.totalGravada ?? resumen.subTotal),
+    receptorDoc: txt(receptor.nit || receptor.numDocumento || receptor.dui),
+    ventaGravada: isRet
+      ? ""
+      : num(isDcl ? b0.valorOperaciones : resumen.totalGravada ?? resumen.totalCompra ?? resumen.subTotal),
     ventaExenta: num(resumen.totalExenta),
     ventaNoSuj: num(resumen.totalNoSuj),
     descuento: num(resumen.totalDescu),
     iva: num(iva),
-    ivaRetenido: num(resumen.ivaRete1),
+    montoSujeto: num(
+      isRet ? resumen.totalSujetoRetencion : isDcl ? b0.montoSujetoPercepcion : resumen.totalSujetoRetencion
+    ),
+    ivaRetenido: num(isRet ? resumen.totalIVAretenido : resumen.ivaRete1 ?? resumen.totalIVAretenido),
     rentaRetenida: num(resumen.reteRenta),
-    total: num(resumen.montoTotalOperacion ?? resumen.totalPagar),
+    total: isRet
+      ? ""
+      : num(
+          isDcl
+            ? b0.liquidoApagar
+            : resumen.montoTotalOperacion ?? resumen.totalPagar ?? resumen.total ?? resumen.totalCompra
+        ),
     condicionOperacion: CONDICION_OP[resumen.condicionOperacion] || "",
     sello: json.selloRecibido || json.sello_recibido || "",
-    items: items.map((it, idx) => ({
-      archivo: filename,
-      numeroControl: ident.numeroControl || "",
-      numItem: it.numItem ?? idx + 1,
-      codigo: it.codigo || "",
-      descripcion: it.descripcion || "",
-      cantidad: num(it.cantidad),
-      unidad: it.uniMedida ?? it.unidadMedida ?? "",
-      precioUni: num(it.precioUni),
-      descu: num(it.montoDescu),
-      ventaNoSuj: num(it.ventaNoSuj),
-      ventaExenta: num(it.ventaExenta),
-      ventaGravada: num(it.ventaGravada),
-    })),
+    nDocs: bodyArr.length,
+    issues,
+    valEstado: VAL_LABEL[status],
+    valStatus: status,
+    valDetalle: issues
+      .map((i) => `${i.level === "error" ? "ERROR" : "Aviso"}: ${i.msg}`)
+      .join(" | "),
+    urlMH,
+    items,
   };
 }
 
@@ -180,10 +417,11 @@ function parseAny(json, filename) {
 const RESUMEN_COLS = [
   ["archivo", "Archivo"],
   ["tipoLabel", "Tipo de documento"],
-  ["codigoGeneracion", "Código de generación"],
-  ["numeroControl", "Número de control"],
   ["fechaEmision", "Fecha de emisión"],
   ["horaEmision", "Hora de emisión"],
+  ["codigoGeneracion", "Código de generación"],
+  ["sello", "Sello de recepción"],
+  ["numeroControl", "Número de control"],
   ["emisorNombre", "Emisor"],
   ["emisorNit", "NIT emisor"],
   ["emisorNrc", "NRC emisor"],
@@ -194,11 +432,31 @@ const RESUMEN_COLS = [
   ["ventaNoSuj", "Venta no sujeta"],
   ["descuento", "Descuento"],
   ["iva", "IVA"],
-  ["ivaRetenido", "IVA retenido"],
+  ["montoSujeto", "Monto sujeto"],
+  ["ivaRetenido", "IVA retenido (1%)"],
   ["rentaRetenida", "Renta retenida"],
   ["total", "Total a pagar"],
   ["condicionOperacion", "Condición de operación"],
-  ["sello", "Sello de recibido"],
+  ["valEstado", "Validación local"],
+  ["valDetalle", "Detalle de validación"],
+  ["urlMH", "Consulta pública MH"],
+];
+const RET_COLS = [
+  ["archivo", "Archivo"],
+  ["fechaEmision", "Fecha de emisión"],
+  ["codigoGeneracion", "Código de generación"],
+  ["sello", "Sello de recepción"],
+  ["numeroControl", "Número de control"],
+  ["emisorNit", "NIT emisor (agente de retención)"],
+  ["emisorNombre", "Emisor"],
+  ["receptorDoc", "NIT receptor (sujeto retenido)"],
+  ["receptorNombre", "Receptor"],
+  ["nDocs", "N° docs. relacionados"],
+  ["montoSujeto", "Monto sujeto a retención"],
+  ["ivaRetenido", "IVA retenido (1%)"],
+  ["valEstado", "Validación local"],
+  ["valDetalle", "Detalle de validación"],
+  ["urlMH", "Consulta pública MH"],
 ];
 const MONEY_KEYS = new Set([
   "ventaGravada",
@@ -206,11 +464,13 @@ const MONEY_KEYS = new Set([
   "ventaNoSuj",
   "descuento",
   "iva",
+  "montoSujeto",
   "ivaRetenido",
   "rentaRetenida",
   "total",
   "precioUni",
   "descu",
+  "ivaRetItem",
 ]);
 const ITEM_COLS = [
   ["archivo", "Archivo"],
@@ -218,6 +478,8 @@ const ITEM_COLS = [
   ["numItem", "N° item"],
   ["codigo", "Código"],
   ["descripcion", "Descripción"],
+  ["docRel", "Documento relacionado"],
+  ["fechaDocRel", "Fecha doc. relacionado"],
   ["cantidad", "Cantidad"],
   ["unidad", "Unidad"],
   ["precioUni", "Precio unitario"],
@@ -225,6 +487,17 @@ const ITEM_COLS = [
   ["ventaNoSuj", "Venta no sujeta"],
   ["ventaExenta", "Venta exenta"],
   ["ventaGravada", "Venta gravada"],
+  ["montoSujeto", "Monto sujeto"],
+  ["ivaRetItem", "IVA retenido"],
+  ["codRetencion", "Código retención MH"],
+];
+const VAL_COLS = [
+  ["archivo", "Archivo"],
+  ["numeroControl", "Número de control"],
+  ["codigoGeneracion", "Código de generación"],
+  ["valEstado", "Estado"],
+  ["nivel", "Nivel"],
+  ["mensaje", "Observación"],
 ];
 
 function sheetFromCols(rows, cols) {
@@ -232,22 +505,29 @@ function sheetFromCols(rows, cols) {
   const aoa = [header, ...rows.map((r) => cols.map(([key]) => r[key] ?? ""))];
   const ws = XLSX.utils.aoa_to_sheet(aoa);
   cols.forEach(([key], c) => {
-    if (MONEY_KEYS.has(key)) {
-      for (let r = 1; r <= rows.length; r++) {
-        const cell = ws[XLSX.utils.encode_cell({ r, c })];
-        if (cell && typeof cell.v === "number") cell.z = "#,##0.00";
+    for (let r = 1; r <= rows.length; r++) {
+      const addr = XLSX.utils.encode_cell({ r, c });
+      const cell = ws[addr];
+      if (key === "urlMH") {
+        const url = rows[r - 1].urlMH;
+        if (url) ws[addr] = { t: "s", v: "Verificar en MH", l: { Target: url, Tooltip: url } };
+      } else if (MONEY_KEYS.has(key) && cell && typeof cell.v === "number") {
+        cell.z = "#,##0.00";
       }
     }
   });
-  ws["!cols"] = cols.map(([, label]) => ({
-    wch: Math.max(12, Math.min(32, label.length + 4)),
-  }));
+  // Ancho según el contenido, para que los códigos largos salgan completos
+  ws["!cols"] = cols.map(([key, label]) => {
+    if (key === "urlMH") return { wch: 18 };
+    const longest = rows.reduce(
+      (m, r) => Math.max(m, String(r[key] ?? "").length),
+      label.length
+    );
+    return { wch: Math.min(70, Math.max(12, longest + 2)) };
+  });
   if (rows.length) {
     ws["!autofilter"] = {
-      ref: XLSX.utils.encode_range(
-        { r: 0, c: 0 },
-        { r: rows.length, c: cols.length - 1 }
-      ),
+      ref: XLSX.utils.encode_range({ r: 0, c: 0 }, { r: rows.length, c: cols.length - 1 }),
     };
   }
   return ws;
@@ -284,17 +564,20 @@ function buildWorkbook(docs, { separarPorTipo, incluirDetalle }) {
 
   if (dte.length) {
     if (separarPorTipo) {
-      ["Crédito Fiscal", "Consumidor Final", "Otros DTE"].forEach((b) => {
+      BUCKETS.forEach((b) => {
         const rows = dte.filter((d) => d.bucket === b);
-        if (rows.length) addSheet(wb, `Resumen - ${b}`, sheetFromCols(rows, RESUMEN_COLS));
+        if (rows.length)
+          addSheet(wb, `Resumen - ${b}`, sheetFromCols(rows, b === "Retención IVA" ? RET_COLS : RESUMEN_COLS));
       });
     } else {
       addSheet(wb, "Resumen DTE", sheetFromCols(dte, RESUMEN_COLS));
+      const ret = dte.filter((d) => d.bucket === "Retención IVA");
+      if (ret.length) addSheet(wb, "Retenciones IVA", sheetFromCols(ret, RET_COLS));
     }
 
     if (incluirDetalle) {
       if (separarPorTipo) {
-        ["Crédito Fiscal", "Consumidor Final", "Otros DTE"].forEach((b) => {
+        BUCKETS.forEach((b) => {
           const items = dte.filter((d) => d.bucket === b).flatMap((d) => d.items);
           if (items.length) addSheet(wb, `Detalle - ${b}`, sheetFromCols(items, ITEM_COLS));
         });
@@ -303,6 +586,29 @@ function buildWorkbook(docs, { separarPorTipo, incluirDetalle }) {
         if (items.length) addSheet(wb, "Detalle de items", sheetFromCols(items, ITEM_COLS));
       }
     }
+
+    const valRows = dte.flatMap((d) =>
+      d.issues.length
+        ? d.issues.map((i) => ({
+            archivo: d.archivo,
+            numeroControl: d.numeroControl,
+            codigoGeneracion: d.codigoGeneracion,
+            valEstado: d.valEstado,
+            nivel: i.level === "error" ? "Error" : "Aviso",
+            mensaje: i.msg,
+          }))
+        : [
+            {
+              archivo: d.archivo,
+              numeroControl: d.numeroControl,
+              codigoGeneracion: d.codigoGeneracion,
+              valEstado: d.valEstado,
+              nivel: "",
+              mensaje: "Sin observaciones",
+            },
+          ]
+    );
+    addSheet(wb, "Validación", sheetFromCols(valRows, VAL_COLS));
   }
 
   if (generic.length) {
@@ -359,6 +665,27 @@ const EJEMPLOS = [
       resumen: { totalGravada: 228, totalExenta: 0, totalNoSuj: 0, totalDescu: 0, tributos: [{ codigo: "20", descripcion: "IVA", valor: 29.64 }], montoTotalOperacion: 257.64, condicionOperacion: 2 },
     },
   },
+  {
+    filename: "ejemplo-retencion-iva.json",
+    json: {
+      selloRecibido: "2026AB123CD456EF789GH012IJ345KL678MN901OP",
+      identificacion: {
+        ambiente: "01",
+        tipoDte: "07",
+        numeroControl: "DTE-07-M001P002-000000000000010",
+        codigoGeneracion: "7C1D2E3F-0000-4E00-9A00-000000000007",
+        fecEmi: "2026-09-04",
+        horEmi: "14:12:43",
+        tipoMoneda: "USD",
+      },
+      emisor: { nombre: "Aseguradora Ejemplo, S.A.", nit: "06140101900011", nrc: "100001" },
+      receptor: { tipoDocumento: "36", numDocumento: "06140202950022", nombre: "Restaurante Ejemplo, S.A. de C.V." },
+      cuerpoDocumento: [
+        { numItem: 1, tipoDte: "01", tipoDoc: 2, numDocumento: "A1B2C3D4-0000-4E00-9A00-000000000099", fechaEmision: "2026-07-15", montoSujetoGrav: 142.27, codigoRetencionMH: "22", ivaRetenido: 1.42, descripcion: "RETENCIÓN 1%" },
+      ],
+      resumen: { totalSujetoRetencion: 142.27, totalIVAretenido: 1.42, totalIVAretenidoLetras: "(UN 42/100 DOLARES)" },
+    },
+  },
 ];
 
 /* ----------------------------------------------------------------
@@ -378,7 +705,7 @@ export default function JsonToExcelApp() {
   const addEntry = useCallback((name, text) => {
     const id = `${name}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
     try {
-      const json = JSON.parse(text);
+      const json = JSON.parse(text.replace(/^\uFEFF/, ""));
       const doc = parseAny(json, name);
       setEntries((prev) => [...prev, { id, name, status: "ok", doc }]);
     } catch (e) {
@@ -424,7 +751,7 @@ export default function JsonToExcelApp() {
   const submitPaste = () => {
     if (!pasteText.trim()) return;
     try {
-      JSON.parse(pasteText);
+      JSON.parse(pasteText.replace(/^\uFEFF/, ""));
       addEntry(`pegado-${entries.length + 1}.json`, pasteText);
       setPasteText("");
       setPasteError("");
@@ -440,11 +767,18 @@ export default function JsonToExcelApp() {
   const dteDocs = docs.filter((d) => d.kind === "dte");
 
   const stats = useMemo(() => {
-    const totalMonto = dteDocs.reduce((a, d) => a + (typeof d.total === "number" ? d.total : 0), 0);
-    const cf = dteDocs.filter((d) => d.bucket === "Crédito Fiscal").length;
-    const cons = dteDocs.filter((d) => d.bucket === "Consumidor Final").length;
-    const otros = dteDocs.filter((d) => d.bucket === "Otros DTE").length;
-    return { totalMonto, cf, cons, otros, totalItems: dteDocs.reduce((a, d) => a + d.items.length, 0) };
+    const sign = (d) => (d.bucket === "Nota de Crédito" ? -1 : 1);
+    const totalMonto = round2(
+      dteDocs.reduce((a, d) => a + (typeof d.total === "number" ? sign(d) * d.total : 0), 0)
+    );
+    const montoSujeto = round2(dteDocs.reduce((a, d) => a + (typeof d.montoSujeto === "number" ? d.montoSujeto : 0), 0));
+    const ivaRet = round2(dteDocs.reduce((a, d) => a + (typeof d.ivaRetenido === "number" ? d.ivaRetenido : 0), 0));
+    const byBucket = {};
+    dteDocs.forEach((d) => {
+      byBucket[d.bucket] = (byBucket[d.bucket] || 0) + 1;
+    });
+    const conObs = dteDocs.filter((d) => d.valStatus !== "ok").length;
+    return { totalMonto, montoSujeto, ivaRet, byBucket, conObs, totalItems: dteDocs.reduce((a, d) => a + d.items.length, 0) };
   }, [dteDocs]);
 
   const previewRows = useMemo(() => {
@@ -461,6 +795,12 @@ export default function JsonToExcelApp() {
 
   const money = (v) =>
     typeof v === "number" ? v.toLocaleString("es-SV", { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : "—";
+
+  const th = { textAlign: "left", padding: "9px 12px", color: C.inkSoft, fontWeight: 700, borderBottom: `1px solid ${C.line}`, whiteSpace: "nowrap" };
+  const thR = { ...th, textAlign: "right" };
+  const td = { padding: "9px 12px" };
+  const tdMono = { ...td, color: C.inkSoft, fontFamily: mono, fontSize: 11.5, whiteSpace: "nowrap" };
+  const tdNum = { ...td, textAlign: "right", fontVariantNumeric: "tabular-nums", whiteSpace: "nowrap" };
 
   return (
     <div style={{ background: C.page, minHeight: "100vh", fontFamily: sans, color: C.ink }}>
@@ -487,7 +827,7 @@ export default function JsonToExcelApp() {
                 De DTE a Excel
               </h1>
               <p style={{ margin: "2px 0 0", color: C.inkSoft, fontSize: 14.5 }}>
-                Reúne tus Comprobantes de Crédito Fiscal y Facturas de Consumidor Final en un solo libro, listo para revisar.
+                Reúne tus Créditos Fiscales, Facturas, Notas de Crédito, Retenciones, Sujetos Excluidos y Liquidaciones en un solo libro, con validación.
               </p>
             </div>
           </div>
@@ -497,7 +837,7 @@ export default function JsonToExcelApp() {
       <main style={{ maxWidth: 1120, margin: "0 auto", padding: "28px 24px 64px" }}>
         <div className="app-grid">
           {/* Columna izquierda */}
-          <div style={{ display: "flex", flexDirection: "column", gap: 18 }}>
+          <div style={{ display: "flex", flexDirection: "column", gap: 18, minWidth: 0 }}>
             {/* Dropzone */}
             <div
               style={{ ...card, padding: 18 }}
@@ -590,7 +930,7 @@ export default function JsonToExcelApp() {
                       borderRadius: 7,
                       padding: 10,
                       fontSize: 12.5,
-                      fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+                      fontFamily: mono,
                       resize: "vertical",
                       boxSizing: "border-box",
                     }}
@@ -712,7 +1052,7 @@ export default function JsonToExcelApp() {
                 <span>
                   Separar por tipo de documento
                   <div style={{ color: C.inkFaint, fontSize: 12 }}>
-                    Una hoja de resumen para Crédito Fiscal y otra para Consumidor Final.
+                    Una hoja de resumen por cada tipo: Crédito Fiscal, Consumidor Final, Nota de Crédito, Retención IVA, Sujeto Excluido y Liquidación.
                   </div>
                 </span>
               </label>
@@ -726,7 +1066,7 @@ export default function JsonToExcelApp() {
                 <span>
                   Incluir detalle de productos
                   <div style={{ color: C.inkFaint, fontSize: 12 }}>
-                    Agrega hoja(s) con cada línea de producto o servicio.
+                    Agrega hoja(s) con cada línea; en retenciones, cada documento relacionado con su monto sujeto y retención.
                   </div>
                 </span>
               </label>
@@ -754,15 +1094,15 @@ export default function JsonToExcelApp() {
             </button>
           </div>
 
-          {/* Columna derecha: resumen + vista previa */}
-          <div style={{ display: "flex", flexDirection: "column", gap: 18 }}>
+          {/* Columna derecha: resumen + validación + vista previa */}
+          <div style={{ display: "flex", flexDirection: "column", gap: 18, minWidth: 0 }}>
             {/* Tarjetas de estadísticas */}
             <div className="stats-grid">
               {[
                 { label: "Documentos", value: dteDocs.length, tint: C.surface },
-                { label: "Crédito Fiscal", value: stats.cf, tint: C.navyTint, fg: C.navyText },
-                { label: "Consumidor Final", value: stats.cons, tint: C.goldTint, fg: C.goldText },
-                { label: "Total operado", value: `$${money(stats.totalMonto)}`, tint: C.successTint, fg: C.success },
+                { label: "Total operado (NC resta)", value: `$${money(stats.totalMonto)}`, tint: C.successTint, fg: C.success },
+                { label: "Monto sujeto", value: `$${money(stats.montoSujeto)}`, tint: C.navyTint, fg: C.navyText },
+                { label: "IVA retenido (1%)", value: `$${money(stats.ivaRet)}`, tint: C.goldTint, fg: C.goldText },
               ].map((s) => (
                 <div key={s.label} style={{ ...card, padding: "14px 16px", background: s.tint }}>
                   <div style={{ fontSize: 12, color: s.fg || C.inkFaint, fontWeight: 600 }}>{s.label}</div>
@@ -771,6 +1111,19 @@ export default function JsonToExcelApp() {
               ))}
             </div>
 
+            {dteDocs.length > 0 && (
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+                {BUCKETS.filter((b) => stats.byBucket[b]).map((b) => (
+                  <span
+                    key={b}
+                    style={{ fontSize: 12.5, padding: "4px 11px", borderRadius: 999, background: BUCKET_STYLE[b].bg, color: BUCKET_STYLE[b].fg, fontWeight: 600 }}
+                  >
+                    {b}: {stats.byBucket[b]}
+                  </span>
+                ))}
+              </div>
+            )}
+
             {errorEntries.length > 0 && (
               <div style={{ ...card, padding: 12, background: C.dangerTint, borderColor: "transparent", display: "flex", gap: 8, alignItems: "flex-start" }}>
                 <AlertTriangle size={16} color={C.danger} style={{ marginTop: 1, flexShrink: 0 }} />
@@ -778,6 +1131,61 @@ export default function JsonToExcelApp() {
                   {errorEntries.length === 1
                     ? "1 archivo no se pudo leer y no se incluirá en el Excel."
                     : `${errorEntries.length} archivos no se pudieron leer y no se incluirán en el Excel.`}
+                </div>
+              </div>
+            )}
+
+            {/* Validación */}
+            {dteDocs.length > 0 && (
+              <div style={{ ...card, padding: 16 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
+                  <ShieldCheck size={17} color={C.navyText} />
+                  <span style={{ fontSize: 14, fontWeight: 700 }}>Validación</span>
+                  <span style={{ fontSize: 12.5, color: stats.conObs ? C.warn : C.success, marginLeft: "auto" }}>
+                    {stats.conObs
+                      ? `${stats.conObs} de ${dteDocs.length} con observaciones`
+                      : `${dteDocs.length} de ${dteDocs.length} sin observaciones`}
+                  </span>
+                </div>
+                <p style={{ fontSize: 12, color: C.inkFaint, lineHeight: 1.55, margin: "0 0 10px" }}>
+                  Revisa formato, sello, firma y cuadre de montos en tu navegador. La confirmación oficial la da el
+                  portal de Consulta Pública de DTE del Ministerio de Hacienda: el botón abre el documento ya cargado.
+                </p>
+                <div style={{ display: "flex", flexDirection: "column", gap: 6, maxHeight: 260, overflowY: "auto" }}>
+                  {dteDocs.map((d, i) => {
+                    const vs = VAL_STYLE[d.valStatus];
+                    return (
+                      <div key={i} style={{ padding: "8px 10px", borderRadius: 7, background: C.surfaceSoft, border: `1px solid ${C.line}` }}>
+                        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                          <span style={{ fontSize: 10.5, padding: "2px 8px", borderRadius: 999, background: vs.bg, color: vs.fg, whiteSpace: "nowrap", fontWeight: 600 }}>
+                            {d.valEstado}
+                          </span>
+                          <span style={{ fontSize: 12, fontFamily: mono, color: C.inkSoft, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1 }}>
+                            {d.numeroControl || d.archivo}
+                          </span>
+                          {d.urlMH && (
+                            <a
+                              href={d.urlMH}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 12, color: C.navyText, textDecoration: "none", whiteSpace: "nowrap", fontWeight: 600 }}
+                            >
+                              Verificar en MH <ExternalLink size={12} />
+                            </a>
+                          )}
+                        </div>
+                        {d.issues.length > 0 && (
+                          <ul style={{ margin: "6px 0 0", paddingLeft: 18, fontSize: 12, color: C.inkSoft, lineHeight: 1.5 }}>
+                            {d.issues.map((it, k) => (
+                              <li key={k} style={{ color: it.level === "error" ? C.danger : C.warn }}>
+                                {it.msg}
+                              </li>
+                            ))}
+                          </ul>
+                        )}
+                      </div>
+                    );
+                  })}
                 </div>
               </div>
             )}
@@ -820,25 +1228,33 @@ export default function JsonToExcelApp() {
                   <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12.5 }}>
                     <thead>
                       <tr style={{ background: C.surfaceSoft }}>
-                        {["Tipo", "N° control", "Emisor", "Receptor", "Total"].map((h) => (
-                          <th key={h} style={{ textAlign: "left", padding: "9px 12px", color: C.inkSoft, fontWeight: 700, borderBottom: `1px solid ${C.line}`, whiteSpace: "nowrap" }}>
-                            {h}
-                          </th>
-                        ))}
+                        <th style={th}>Tipo</th>
+                        <th style={th}>Fecha</th>
+                        <th style={th}>Código de generación</th>
+                        <th style={th}>Sello de recepción</th>
+                        <th style={th}>NIT emisor</th>
+                        <th style={th}>Receptor</th>
+                        <th style={thR}>Monto sujeto</th>
+                        <th style={thR}>IVA ret. 1%</th>
+                        <th style={thR}>Total</th>
                       </tr>
                     </thead>
                     <tbody>
                       {previewRows.map((d, i) => (
                         <tr key={i} style={{ borderBottom: `1px solid ${C.line}` }}>
-                          <td style={{ padding: "9px 12px" }}>
-                            <span style={{ fontSize: 10.5, padding: "2px 7px", borderRadius: 999, background: BUCKET_STYLE[d.bucket].bg, color: BUCKET_STYLE[d.bucket].fg }}>
+                          <td style={td}>
+                            <span style={{ fontSize: 10.5, padding: "2px 7px", borderRadius: 999, background: BUCKET_STYLE[d.bucket].bg, color: BUCKET_STYLE[d.bucket].fg, whiteSpace: "nowrap" }}>
                               {d.bucket}
                             </span>
                           </td>
-                          <td style={{ padding: "9px 12px", color: C.inkSoft, fontFamily: "ui-monospace, monospace", fontSize: 11.5 }}>{d.numeroControl || "—"}</td>
-                          <td style={{ padding: "9px 12px" }}>{d.emisorNombre || "—"}</td>
-                          <td style={{ padding: "9px 12px" }}>{d.receptorNombre || "—"}</td>
-                          <td style={{ padding: "9px 12px", textAlign: "right", fontVariantNumeric: "tabular-nums" }}>${money(d.total)}</td>
+                          <td style={{ ...td, whiteSpace: "nowrap" }}>{d.fechaEmision || "—"}</td>
+                          <td style={tdMono}>{d.codigoGeneracion || "—"}</td>
+                          <td style={tdMono}>{d.sello || "—"}</td>
+                          <td style={tdMono}>{d.emisorNit || "—"}</td>
+                          <td style={{ ...td, whiteSpace: "nowrap" }}>{d.receptorNombre || "—"}</td>
+                          <td style={tdNum}>{d.montoSujeto === "" ? "—" : `$${money(d.montoSujeto)}`}</td>
+                          <td style={tdNum}>{d.ivaRetenido === "" ? "—" : `$${money(d.ivaRetenido)}`}</td>
+                          <td style={tdNum}>{d.total === "" ? "—" : `$${money(d.total)}`}</td>
                         </tr>
                       ))}
                     </tbody>
@@ -853,26 +1269,31 @@ export default function JsonToExcelApp() {
                 <div style={{ overflowX: "auto" }}>
                   {stats.totalItems === 0 ? (
                     <div style={{ padding: "36px 20px", textAlign: "center", color: C.inkFaint, fontSize: 13.5 }}>
-                      Ninguno de los documentos cargados trae líneas de producto (cuerpoDocumento).
+                      Ninguno de los documentos cargados trae líneas (cuerpoDocumento).
                     </div>
                   ) : (
                     <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12.5 }}>
                       <thead>
                         <tr style={{ background: C.surfaceSoft }}>
-                          {["Descripción", "Cant.", "Precio unit.", "Venta gravada"].map((h) => (
-                            <th key={h} style={{ textAlign: h === "Descripción" ? "left" : "right", padding: "9px 12px", color: C.inkSoft, fontWeight: 700, borderBottom: `1px solid ${C.line}` }}>
-                              {h}
-                            </th>
-                          ))}
+                          <th style={th}>Descripción</th>
+                          <th style={th}>Doc. relacionado</th>
+                          <th style={thR}>Cant.</th>
+                          <th style={thR}>Precio unit.</th>
+                          <th style={thR}>Venta gravada</th>
+                          <th style={thR}>Monto sujeto</th>
+                          <th style={thR}>IVA ret.</th>
                         </tr>
                       </thead>
                       <tbody>
                         {previewRows.map((it, i) => (
                           <tr key={i} style={{ borderBottom: `1px solid ${C.line}` }}>
-                            <td style={{ padding: "9px 12px" }}>{it.descripcion || "—"}</td>
-                            <td style={{ padding: "9px 12px", textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{it.cantidad}</td>
-                            <td style={{ padding: "9px 12px", textAlign: "right", fontVariantNumeric: "tabular-nums" }}>${money(it.precioUni)}</td>
-                            <td style={{ padding: "9px 12px", textAlign: "right", fontVariantNumeric: "tabular-nums" }}>${money(it.ventaGravada)}</td>
+                            <td style={td}>{it.descripcion || "—"}</td>
+                            <td style={tdMono}>{it.docRel || "—"}</td>
+                            <td style={tdNum}>{it.cantidad}</td>
+                            <td style={tdNum}>{it.precioUni === "" ? "—" : `$${money(it.precioUni)}`}</td>
+                            <td style={tdNum}>{it.ventaGravada === "" ? "—" : `$${money(it.ventaGravada)}`}</td>
+                            <td style={tdNum}>{it.montoSujeto === "" ? "—" : `$${money(it.montoSujeto)}`}</td>
+                            <td style={tdNum}>{it.ivaRetItem === "" ? "—" : `$${money(it.ivaRetItem)}`}</td>
                           </tr>
                         ))}
                       </tbody>
